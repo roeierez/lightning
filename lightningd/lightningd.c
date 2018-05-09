@@ -85,8 +85,7 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 }
 
 static const char *daemons[] = {
-	"lightning_channeld",
-	"lightning_closingd",
+	"lightning_channeld",	
 	"lightning_gossipd",
 	"lightning_hsmd",
 	"lightning_onchaind",

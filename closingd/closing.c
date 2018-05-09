@@ -21,6 +21,11 @@
 #include <unistd.h>
 #include <wire/peer_wire.h>
 #include <wire/wire_sync.h>
+#include <lightningd/channel.h>
+#include <lightningd/log.h>
+#include <lightningd/peer_control.h>
+#include <lightningd/lightningd.h>
+#include <closingd/closing.h>
 
 /* stdin == requests, 3 == peer, 4 = gossip */
 #define REQ_FD STDIN_FILENO
@@ -193,24 +198,63 @@ static void send_offer(struct crypto_state *cs,
 		peer_failed_connection_lost();
 }
 
-static void tell_master_their_offer(const secp256k1_ecdsa_signature *their_sig,
-				    const struct bitcoin_tx *tx)
+/* Is this better than the last tx we were holding?  This can happen
+ * even without closingd misbehaving, if we have multiple,
+ * interrupted, rounds of negotiation. */
+static bool better_closing_fee(struct channel *channel,
+			       const struct bitcoin_tx *tx)
 {
-	u8 *msg = towire_closing_received_signature(NULL, their_sig, tx);
-	if (!wire_sync_write(REQ_FD, take(msg)))
-		status_failed(STATUS_FAIL_MASTER_IO,
-			      "Writing received to master: %s",
-			      strerror(errno));
+	u64 weight, fee, last_fee, min_fee;
+	size_t i;
 
-	/* Wait for master to ack, to make sure it's in db. */
-	msg = wire_sync_read(NULL, REQ_FD);
-	if (!fromwire_closing_received_signature_reply(msg))
-		master_badmsg(WIRE_CLOSING_RECEIVED_SIGNATURE_REPLY, msg);
-	tal_free(msg);
+	/* Calculate actual fee (adds in eliminated outputs) */
+	fee = channel->funding_satoshi;
+	for (i = 0; i < tal_count(tx->output); i++)
+		fee -= tx->output[i].amount;
+
+	last_fee = channel->funding_satoshi;
+	for (i = 0; i < tal_count(channel->last_tx->output); i++)
+		last_fee -= channel->last_tx->output[i].amount;
+
+	log_debug(channel->log, "Their actual closing tx fee is %"PRIu64
+		 " vs previous %"PRIu64, fee, last_fee);
+
+	/* Weight once we add in sigs. */
+	weight = measure_tx_weight(tx) + 74 * 2;
+
+	min_fee = get_feerate(channel->peer->ld->topology, FEERATE_SLOW) * weight / 1000;
+	if (fee < min_fee) {
+		log_debug(channel->log, "... That's below our min %"PRIu64
+			 " for weight %"PRIu64" at feerate %u",
+			 min_fee, weight,
+			 get_feerate(channel->peer->ld->topology, FEERATE_SLOW));
+		return false;
+	}
+
+	/* Prefer lower fee: in case of a tie, prefer new over old: this
+	 * covers the preference for a mutual close over a unilateral one. */
+	return fee <= last_fee;
+}
+
+static void tell_master_their_offer(struct channel* channel, const secp256k1_ecdsa_signature *their_sig,
+				    struct bitcoin_tx *tx)
+{
+	struct lightningd* ld = channel->peer->ld;
+	// u8 *msg = towire_closing_received_signature(NULL, their_sig, tx);
+	// if (!wire_sync_write(REQ_FD, take(msg)))
+	// 	status_failed(STATUS_FAIL_MASTER_IO,
+	// 		      "Writing received to master: %s",
+	// 		      strerror(errno));	
+
+	if (better_closing_fee(channel, tx)) {
+		channel_set_last_tx(channel, tx, their_sig);
+		/* TODO(cdecker) Selectively save updated fields to DB */
+		wallet_channel_save(ld->wallet, channel);
+	}	
 }
 
 /* Returns fee they offered. */
-static uint64_t receive_offer(struct crypto_state *cs,
+static uint64_t receive_offer(struct channel* channel, struct crypto_state *cs,
 			      const struct channel_id *channel_id,
 			      const struct pubkey funding_pubkey[NUM_SIDES],
 			      const u8 *funding_wscript,
@@ -325,7 +369,7 @@ static uint64_t receive_offer(struct crypto_state *cs,
 	/* Master sorts out what is best offer, we just tell it any above min */
 	if (received_fee >= min_fee_to_accept) {
 		status_trace("...offer is reasonable");
-		tell_master_their_offer(&their_sig, tx);
+		tell_master_their_offer(channel, &their_sig, tx);
 	}
 
 	return received_fee;
@@ -421,13 +465,35 @@ static u64 adjust_offer(struct crypto_state *cs,
 	return (feerange->max + min_fee_to_accept)/2;
 }
 
-int main(int argc, char *argv[])
+static void peer_billboard_cb(bool perm, const char *fmt, ...) {
+	
+}
+
+static void peer_closing_complete(struct channel *channel)
+{	
+	/* Don't report spurious failure when closingd exits. */
+	channel_set_owner(channel, NULL);
+	/* Clear any transient negotiation messages */
+	channel_set_billboard(channel, false, NULL);
+
+	/* Retransmission only, ignore closing. */
+	if (channel->state == CLOSINGD_COMPLETE)
+		return;
+
+	/* Channel gets dropped to chain cooperatively. */
+	drop_to_chain(channel->peer->ld, channel, true);
+	channel_set_state(channel, CLOSINGD_SIGEXCHANGE, CLOSINGD_COMPLETE);
+}
+
+
+void close_channel(struct channel* channel, 
+					u8 *msg,					
+					void (*billboardcb)(void *channel, bool perm, const char *happenings))
 {
-	setup_locale();
+	//setup_locale();
 
 	struct crypto_state cs;
 	const tal_t *ctx = tal(NULL, char);
-	u8 *msg;
 	struct privkey seed;
 	struct pubkey funding_pubkey[NUM_SIDES];
 	struct bitcoin_txid funding_txid;
@@ -444,13 +510,8 @@ int main(int argc, char *argv[])
 	u64 next_index[NUM_SIDES], revocations_received;
 	enum side whose_turn;
 	bool deprecated_api;
-	u8 *channel_reestablish;
-
-	subdaemon_setup(argc, argv);
-
-	status_setup_sync(REQ_FD);
-
-	msg = wire_sync_read(tmpctx, REQ_FD);
+	u8 *channel_reestablish;	
+	
 	if (!fromwire_closing_init(ctx, msg,
 				   &cs, &seed,
 				   &funding_txid, &funding_txout,
@@ -470,12 +531,12 @@ int main(int argc, char *argv[])
 				   &revocations_received,
 				   &deprecated_api,
 				   &channel_reestablish))
-		master_badmsg(WIRE_CLOSING_INIT, msg);
+		master_badmsg(WIRE_CLOSING_INIT, msg); //ROEI TODO
 
-	status_trace("satoshi_out = %"PRIu64"/%"PRIu64,
-		     satoshi_out[LOCAL], satoshi_out[REMOTE]);
-	status_trace("dustlimit = %"PRIu64, our_dust_limit);
-	status_trace("fee = %"PRIu64, offer[LOCAL]);
+	// status_trace("satoshi_out = %"PRIu64"/%"PRIu64,
+	// 	     satoshi_out[LOCAL], satoshi_out[REMOTE]);
+	// status_trace("dustlimit = %"PRIu64, our_dust_limit); ROEI TODO
+	// status_trace("fee = %"PRIu64, offer[LOCAL]);
 	derive_channel_id(&channel_id, &funding_txid, funding_txout);
 	derive_basepoints(&seed, &funding_pubkey[LOCAL], NULL,
 			  &secrets, NULL);
@@ -488,10 +549,9 @@ int main(int argc, char *argv[])
 		do_reconnect(&cs, &channel_id,
 			     next_index, revocations_received,
 			     channel_reestablish);
-
-	peer_billboard(true, "Negotiating closing fee between %"PRIu64
-		       " and %"PRIu64" satoshi (ideal %"PRIu64")",
-		       min_fee_to_accept, commitment_fee, offer[LOCAL]);
+	
+	peer_billboard_cb(true, "Negotiating closing fee between %"PRIu64
+		       " and %"PRIu64" satoshi (ideal %"PRIu64")", min_fee_to_accept, commitment_fee, offer[LOCAL]);
 
 	/* BOLT #2:
 	 *
@@ -511,15 +571,16 @@ int main(int argc, char *argv[])
 				   our_dust_limit, &secrets, offer[LOCAL]);
 		} else {
 			if (i == 0)
-				peer_billboard(false, "Waiting for their initial"
+				peer_billboard_cb(false, "Waiting for their initial"
 					       " closing fee offer");
 			else
-				peer_billboard(false, "Waiting for their initial"
+				peer_billboard_cb(false, "Waiting for their initial"
 					       " closing fee offer:"
 					       " ours was %"PRIu64" satoshi",
 					       offer[LOCAL]);
 			offer[REMOTE]
-				= receive_offer(&cs,
+				= receive_offer(channel, 
+						&cs,
 						&channel_id, funding_pubkey,
 						funding_wscript,
 						scriptpubkey, &funding_txid,
@@ -558,13 +619,13 @@ int main(int argc, char *argv[])
 				   funding_satoshi, satoshi_out, funder,
 				   our_dust_limit, &secrets, offer[LOCAL]);
 		} else {
-			peer_billboard(false, "Waiting for another"
+			peer_billboard_cb(false, "Waiting for another"
 				       " closing fee offer:"
 				       " ours was %"PRIu64" satoshi,"
 				       " theirs was %"PRIu64" satoshi,",
 				       offer[LOCAL], offer[REMOTE]);
 			offer[REMOTE]
-				= receive_offer(&cs, &channel_id,
+				= receive_offer(channel, &cs, &channel_id,
 						funding_pubkey,
 						funding_wscript,
 						scriptpubkey, &funding_txid,
@@ -577,13 +638,13 @@ int main(int argc, char *argv[])
 		whose_turn = !whose_turn;
 	}
 
-	peer_billboard(true, "We agreed on a closing fee of %"PRIu64" satoshi",
+	peer_billboard_cb(true, "We agreed on a closing fee of %"PRIu64" satoshi",
 		       offer[LOCAL]);
 
-	/* We're done! */
-	wire_sync_write(REQ_FD,	take(towire_closing_complete(NULL)));
+	/* We're done! */	
+	peer_closing_complete(channel);	
 	tal_free(ctx);
-	daemon_shutdown();
+	//daemon_shutdown();
 
-	return 0;
+	//return 0;
 }
